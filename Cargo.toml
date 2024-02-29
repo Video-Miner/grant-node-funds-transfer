@@ -1,0 +1,19 @@
+[package]
+name = "livepeer-funds-transfer"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Framework Level Deps
+tokio = { version = "1.32.0", features = ["rt-multi-thread","macros"] }
+dotenv = "0.15.0"
+serde_json="1.0.105"
+serde={version="1.0.188",features=["derive"]}
+
+tracing = "0.1.37"
+tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
+
+# Etherium Deps
+ethers = {version="2.0.8", features= ["rustls"]}
+chrono={version="0.4.27",features=["serde"]}

@@ -1,0 +1,8 @@
+target/
+keys/
+*.env*
+**/*.rs.bk
+*.log
+*.env
+.idea/
+.vscode/
