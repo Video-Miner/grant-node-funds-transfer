@@ -1,0 +1,23 @@
+version: '3'
+
+services:
+  funds-transfer:
+    image: tztcloud/livepeer-funds-transfer:0.0.2
+    container_name: "funds-transfer"
+    hostname: "funds-transfer"
+    restart: unless-stopped
+    environment:
+      - RUST_LOG=info,funds_transfer=info
+      - RPC_ENDPOINT_URL=https://YOUR_RPC_URL
+      - PASSPHRASE_FILE=/root/keys/eth-secret.txt
+      - JSON_KEY_FILE=/root/keys/key.json
+      - ORCH_ETH_ADDR=YOUR_ORCH_ETH_ADDR
+      - TRANSFER_BOND_RECIPIENT_ETH_ADDR=YOUR_TRANSFER_BOND_RECIPIENT_ETH_ADDR
+      - ETH_FEE_RECIPIENT_ETH_ADDR=YOUR_ETH_FEE_RECIPIENT_ADDR
+      - LPT_RESERVE_AMOUNT=1.0
+      - CHAIN_ID=42161
+    volumes:
+      - lpData:/root/keys
+volumes:
+  lpData:
+    external: true
