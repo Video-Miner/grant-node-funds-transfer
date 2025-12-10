@@ -38,6 +38,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("ETH_FEE_RECIPIENT_ETH_ADDR").expect("ETH_FEE_RECIPIENT_ETH_ADDR missing");
     let transfer_bond_recipient_eth_addr = std::env::var("TRANSFER_BOND_RECIPIENT_ETH_ADDR")
         .expect("TRANSFER_BOND_RECIPIENT_ETH_ADDR missing");
+    let lpt_reserve_amount_str =
+        std::env::var("LPT_RESERVE_AMOUNT").unwrap_or_else(|_| "1.0".to_string());
+    let lpt_reserve_amount_f64 = lpt_reserve_amount_str
+        .parse::<f64>()
+        .expect("LPT_RESERVE_AMOUNT is not a valid float");
     let chain_id = std::env::var("CHAIN_ID").expect("CHAIN_ID missing");
     let chain_id = chain_id.parse::<u64>().expect("CHAIN_ID is not a u64 type");
 
@@ -66,12 +71,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("orch_eth_addr [{}] ", &orch_eth_addr);
     let orch_wallet = orch_eth_addr.parse::<Address>()?;
 
+    info!("LPT reserve amount [{}] ", &lpt_reserve_amount_f64);
+
     info!("chain id [{}] ", &chain_id);
 
     let address_zero = "0x0000000000000000000000000000000000000000".parse::<Address>()?;
 
     let pending_fee_threshold = 0.03;
-    let one_eth_in_wei: i64 = 1000000000000000000;
+    let lpt_reserve_in_wei: U256 = U256::from_dec_str(
+        &((lpt_reserve_amount_f64 * 1e18) as u64).to_string(),
+    )?;
 
     // load the passhpase and private key json files to construct the Orch Wallet
     info!("loading passphrase file name [{}] ", &passphrase_file);
@@ -154,10 +163,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap();
         info!("Total stake [{}] ETH", &orch_pending_stake);
 
-        if orch_pending_stake > 1.0 {
+        if orch_pending_stake > lpt_reserve_amount_f64 {
             // STEP 2: calc the total - 1 LPT
 
-            let lpt_to_transfer_bond = orch_pending_stake_wei - one_eth_in_wei;
+            let lpt_to_transfer_bond = orch_pending_stake_wei - lpt_reserve_in_wei;
             info!("Stake ready for transfer [{}] WEI", &lpt_to_transfer_bond);
 
             //  STEP 3:  transfer bond from ORCH wallet to Livepeer STAKE wallet
