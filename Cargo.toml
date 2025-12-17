@@ -1,12 +1,12 @@
 [package]
 name = "livepeer-funds-transfer"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 publish = false
 
 [dependencies]
 # Framework Level Deps
-tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros", "time"] }
 dotenv = "0.15.0"
 serde = { version = "1.0.228", features = ["derive"] }
 
