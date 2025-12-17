@@ -19,12 +19,15 @@ A Rust-based automated service for managing Livepeer Protocol token (LPT) stakin
 
 ## Overview
 
-This service automates two critical tasks for Livepeer orchestrators:
+This service automates Livepeer orchestrator operations by monitoring the Livepeer round lifecycle and executing actions based on on-chain round state.
 
-1. **Bond Transfer**: Automatically transfers bonded LPT from an orchestrator wallet to a designated staking wallet, maintaining a minimum balance of 1 LPT in the orchestrator wallet
-2. **Fee Withdrawal**: Monitors and withdraws accumulated ETH fees when they exceed a configurable threshold (default: 0.03 ETH)
+The application performs the following tasks:
 
-The application operates on a 30-minute polling cycle and only executes transactions when the current Livepeer round is locked, ensuring safe and predictable operations.
+1. **Reward Claiming**: Calls `reward()` exactly once per round when a new round is initialized
+2. **Bond Transfer**: Transfers bonded LPT from the orchestrator wallet once the round is locked, while retaining a minimum bonded balance
+3. **Fee Withdrawal**: Withdraws accumulated ETH fees when they exceed a configurable threshold
+
+The application runs continuously using a polling loop and safely retries failed actions on subsequent iterations.
 
 ## Architecture
 
@@ -61,19 +64,22 @@ The application interacts with two Livepeer Protocol smart contracts on Arbitrum
 
 ## Features
 
-- **Automated LPT Transfer**: Transfers excess bonded LPT while maintaining operational reserve
-- **Fee Management**: Automatically withdraws accumulated fees above threshold
-- **Round Awareness**: Only executes when Livepeer rounds are locked for safety
-- **Configurable**: All parameters controlled via environment variables
-- **Logging**: Comprehensive structured logging with tracing
+- **Round-Aware Rewarding**: Calls `reward()` once per initialized round using on-chain state to prevent duplicates
+- **Automated LPT Transfer**: Transfers all excess bonded LPT while retaining a minimum bonded amount on the orchestrator
+- **Fee Management**: Withdraws accumulated ETH fees above a configurable threshold
+- **Round Safety**: Bond transfers and fee withdrawals only occur when the round is locked
+- **Polling-Based Execution**: Runs continuously and reacts to round state changes
+- **Keystore-Based Signing**: Uses encrypted JSON keystore and passphrase files (no private keys in env vars)
+- **Configurable**: All operational parameters controlled via environment variables
+- **Logging**: Structured logging suitable for auditing and monitoring
 - **Docker Support**: Production-ready containerization
-- **Error Handling**: Robust error handling with transaction status monitoring
+- **Error Handling**: No panics; failures are logged and retried on the next polling cycle
 
 ## Prerequisites
 
 ### Development
 
-- Rust 1.75.0 or later
+- Rust 1.90.0 or later
 - Cargo (comes with Rust)
 - Access to an Arbitrum RPC endpoint
 - Encrypted Ethereum keystore file (JSON format)
@@ -107,29 +113,41 @@ source $HOME/.cargo/env
 Create a `.env` file in the project root with the following variables:
 
 ```bash
-# Logging level (trace, debug, info, warn, error)
-RUST_LOG=info
+# Logging configuration
+RUST_LOG=funds_transfer=info
 
-# Arbitrum RPC endpoint URL
-RPC_ENDPOINT_URL=https://arb1.arbitrum.io/rpc
+# Arbitrum RPC endpoint
+HTTP_RPC_URL=https://arb1.arbitrum.io/rpc
 
-# Path to the passphrase file for keystore decryption
-PASSPHRASE_FILE=/path/to/passphrase.txt
-
-# Path to the encrypted JSON keystore file
+# Path to encrypted keystore file
 JSON_KEY_FILE=/path/to/keystore.json
 
-# Orchestrator wallet address (the wallet being monitored)
-ORCH_ETH_ADDR=0xYourOrchestratorAddress
+# Path to keystore passphrase file
+PASSPHRASE_FILE=/path/to/passphrase.txt
 
-# Recipient address for withdrawn ETH fees
-ETH_FEE_RECIPIENT_ETH_ADDR=0xYourFeeRecipientAddress
+# Optional: orchestrator address (derived from keystore if omitted)
+# ORCHESTRATOR_ADDR=0xYourOrchestratorAddress
 
 # Recipient address for transferred bonded LPT
-TRANSFER_BOND_RECIPIENT_ETH_ADDR=0xYourStakeRecipientAddress
+LPT_RECEIVER_ADDR=0xYourStakeRecipientAddress
 
-# Chain ID (Arbitrum One = 42161, Arbitrum Sepolia = 421614)
+# Minimum bonded LPT to retain on the orchestrator (wei)
+# Example: 1 LPT = 1000000000000000000
+LPT_MIN_RETAIN_WEI=1000000000000000000
+
+# Recipient address for withdrawn ETH fees
+ETH_FEE_RECEIVER_ADDR=0xYourFeeRecipientAddress
+
+# Minimum ETH fees required before withdrawal (wei)
+# Example:          0.03 ETH = 30000000000000000
+ETH_FEE_WITHDRAW_THRESHOLD_WEI=30000000000000000
+
+# Chain ID (Arbitrum One = 42161)
 CHAIN_ID=42161
+
+# Polling interval in seconds
+LOOP_SLEEP_SECS=60
+
 ```
 
 ### Configuration Details
@@ -163,11 +181,18 @@ CHAIN_ID=42161
 
 #### Operational Parameters
 
-The following are hardcoded in the application but can be modified in `src/bin/funds_transfer.rs`:
+All operational parameters are configurable via environment variables:
 
-- **pending_fee_threshold**: `0.03` ETH - Minimum fees before withdrawal
-- **sleep_timer_secs**: `1800` seconds (30 minutes) - Polling interval
-- **Reserve LPT**: `1.0` LPT - Minimum balance kept in orchestrator wallet
+- **LPT_MIN_RETAIN_WEI**  
+  Minimum bonded LPT that must remain on the orchestrator after transfers.
+
+- **ETH_FEE_WITHDRAW_THRESHOLD_WEI**  
+  ETH fees must meet or exceed this value before withdrawal.
+
+- **LOOP_SLEEP_SECS**  
+  Polling interval. Failed actions are retried on the next loop iteration.
+
+These values can be adjusted without rebuilding the application.
 
 ## Building
 
@@ -223,21 +248,22 @@ cargo check
 
 ### Application Behavior
 
-The application will:
+The application operates in a continuous loop:
 
-1. Load configuration from environment variables
-2. Connect to the Arbitrum RPC endpoint
-3. Enter a continuous loop that:
-   - Checks if the current round is locked
-   - If locked:
-     - Checks orchestrator's bonded LPT balance
-     - Transfers excess LPT (if > 1 LPT total)
-     - Checks accumulated fees
-     - Withdraws fees (if ≥ 0.03 ETH)
-   - If not locked:
-     - Waits for round to lock
-   - Sleeps for 30 minutes
-   - Repeats
+1. Loads configuration and decrypts the keystore
+2. Polls the Livepeer `RoundsManager` contract to determine:
+   - Current round number
+   - Whether the round is initialized
+   - Whether the round is locked
+3. If the round is initialized:
+   - Calls `reward()` once per round if it has not already been called
+4. If the round is locked:
+   - Transfers bonded LPT in excess of `LPT_MIN_RETAIN_WEI`
+   - Withdraws ETH fees if they exceed the configured threshold
+5. Sleeps for `LOOP_SLEEP_SECS`
+6. Repeats
+
+If a transaction fails, the error is logged and the operation is retried on the next polling cycle.
 
 ### Stopping the Application
 
@@ -309,12 +335,10 @@ This reduces the final image size significantly (from ~2GB to ~100MB).
 The application provides detailed logging at various levels:
 
 ```
-INFO  - Configuration loaded successfully
-INFO  - Current Round [X] is locked
-INFO  - Total stake [Y] ETH
-INFO  - Transfer Bond Transaction sent successfully. Hash: 0x...
-INFO  - Pending fees [Z] Threshold to withdraw [0.03]
-INFO  - Withdraw Fees Transaction sent successfully. Hash: 0x...
+2025-12-17T22:35:27.527313Z  INFO funds_transfer: starting funds_transfer with cfg: chain_id=42161, rounds_manager=0xdd6f56dcc28d3f5f27084381fe8df634985cc39f, bonding_manager=0x35bcf3c30594191d53231e4ff333e8a770453e40, loop_sleep_secs=60
+2025-12-17T22:35:28.253717Z  INFO funds_transfer: orchestrator/signer address: 0xYourOrchestratorAddress
+2025-12-17T22:35:28.564762Z  INFO funds_transfer: round state: round=4032 initialized=true locked=false
+2025-12-17T22:35:28.612253Z DEBUG funds_transfer: reward not needed: lastRewardRound=4032 currentRound=4032
 ```
 
 #### Viewing Logs
@@ -339,7 +363,7 @@ After each transaction, verify on Arbiscan:
 ### Health Checks
 
 Monitor for:
-- Regular log output every 30 minutes
+- Regular log output every 60 seconds
 - Successful transaction hashes
 - No error messages in logs
 - Recipient wallet balances increasing
