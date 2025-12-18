@@ -38,13 +38,18 @@ struct Config {
     // Tx receipt wait timeout
     receipt_timeout_secs: u64,
 
-    // Bond transfer
-    lpt_receiver_addr: Address,
-    lpt_min_retain_wei: U256,
+    // Reward call (optional)
+    enable_reward: bool,
 
-    // Fee withdrawal
-    eth_fee_receiver_addr: Address,
-    eth_fee_withdraw_threshold_wei: U256,
+    // Bond transfer (optional)
+    enable_transfer_bond: bool,
+    lpt_receiver_addr: Option<Address>,
+    lpt_min_retain_wei: Option<U256>,
+
+    // Fee withdrawal (optional)
+    enable_withdraw_fees: bool,
+    eth_fee_receiver_addr: Option<Address>,
+    eth_fee_withdraw_threshold_wei: Option<U256>,
 }
 
 #[derive(Debug)]
@@ -84,6 +89,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging();
 
     let cfg = load_config()?;
+    validate_config(&cfg)?;
+
     info!(
         "starting funds_transfer with cfg: chain_id={}, rounds_manager={:?}, bonding_manager={:?}, loop_sleep_secs={}",
         cfg.chain_id, cfg.rounds_manager_addr, cfg.bonding_manager_addr, cfg.loop_sleep_secs
@@ -153,7 +160,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // 1) When initialized: reward() once per round
-        if state.initialized
+        if cfg.enable_reward
+            && state.initialized
             && let Err(e) = maybe_reward_once_per_round(
                 &bonding,
                 orchestrator_addr,
@@ -167,7 +175,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // 2) When locked: transferBond + withdrawFees
-        if state.locked
+        let any_locked_feature = cfg.enable_transfer_bond || cfg.enable_withdraw_fees;
+        if any_locked_feature
+            && state.locked
             && let Err(e) =
                 handle_locked_round_actions(&bonding, orchestrator_addr, state.round, &cfg).await
         {
@@ -278,132 +288,185 @@ async fn handle_locked_round_actions<M: Middleware>(
     current_round: U256,
     cfg: &Config,
 ) -> Result<(), AppError> {
-    // pendingStake / pendingFees are “as of endRound”; using currentRound keeps it consistent with go-livepeer style.
-    let pending_stake = bonding
-        .pending_stake(orchestrator, current_round)
-        .call()
-        .await
-        .map_err(|e| AppError::Contract(format!("pendingStake() failed: {e}")))?;
+    // If both features are disabled, nothing to do.
+    if !cfg.enable_transfer_bond && !cfg.enable_withdraw_fees {
+        debug!("locked-round actions skipped: both transferBond and withdrawFees are disabled");
+        return Ok(());
+    }
 
-    let pending_fees = bonding
-        .pending_fees(orchestrator, current_round)
-        .call()
-        .await
-        .map_err(|e| AppError::Contract(format!("pendingFees() failed: {e}")))?;
+    // ----------------------------
+    // transferBond (optional)
+    // ----------------------------
+    if cfg.enable_transfer_bond {
+        let receiver = cfg.lpt_receiver_addr.expect("validated at startup");
+        let retain = cfg.lpt_min_retain_wei.expect("validated at startup");
 
-    info!(
-        "locked round actions: pendingStakeWei={} pendingFeesWei={}",
-        pending_stake, pending_fees
-    );
+        let pending_stake = bonding
+            .pending_stake(orchestrator, current_round)
+            .call()
+            .await
+            .map_err(|e| AppError::Contract(format!("pendingStake() failed: {e}")))?;
 
-    // ---- transferBond ----
-    let transferable = match pending_stake.checked_sub(cfg.lpt_min_retain_wei) {
-        Some(v) if !v.is_zero() => v,
-        _ => {
-            debug!(
-                "transferBond skipped: pendingStakeWei={} <= LPT_MIN_RETAIN_WEI={}",
-                pending_stake, cfg.lpt_min_retain_wei
-            );
-            U256::zero()
-        }
-    };
-
-    if !transferable.is_zero() {
         info!(
-            "transferBond sending: from_orchestrator={:?} to_receiver={:?} amountWei={}",
-            orchestrator, cfg.lpt_receiver_addr, transferable
+            "locked transferBond check: round={} pendingStakeWei={} retainWei={}",
+            current_round, pending_stake, retain
         );
 
-        let call = bonding.transfer_bond(
-            cfg.lpt_receiver_addr,
-            transferable,
-            Address::zero(),
-            Address::zero(),
-            Address::zero(),
-            Address::zero(),
-        );
+        // Transfer all excess above retain. If <= retain, skip.
+        let transferable = match pending_stake.checked_sub(retain) {
+            Some(v) if !v.is_zero() => v,
+            _ => {
+                debug!(
+                    "transferBond skipped: pendingStakeWei={} <= retainWei={}",
+                    pending_stake, retain
+                );
+                U256::zero()
+            }
+        };
 
-        match call.send().await {
-            Ok(pending) => {
-                let tx_hash = *pending;
-                info!("transferBond tx sent: tx_hash={:?}", tx_hash);
+        if !transferable.is_zero() {
+            info!(
+                "transferBond sending: from_orchestrator={:?} to_receiver={:?} amountWei={} round={}",
+                orchestrator, receiver, transferable, current_round
+            );
 
-                match timeout(Duration::from_secs(cfg.receipt_timeout_secs), pending).await {
-                    Ok(Ok(Some(receipt))) => {
-                        info!(
-                            "transferBond confirmed: tx_hash={:?} status={:?} block={:?} gas_used={:?}",
-                            receipt.transaction_hash,
-                            receipt.status,
-                            receipt.block_number,
-                            receipt.gas_used
-                        );
+            let call = bonding.transfer_bond(
+                receiver,
+                transferable,
+                Address::zero(),
+                Address::zero(),
+                Address::zero(),
+                Address::zero(),
+            );
+
+            match call.send().await {
+                Ok(pending) => {
+                    let tx_hash = *pending;
+                    info!(
+                        "transferBond tx sent: tx_hash={:?} round={}",
+                        tx_hash, current_round
+                    );
+
+                    match timeout(Duration::from_secs(cfg.receipt_timeout_secs), pending).await {
+                        Ok(Ok(Some(receipt))) => {
+                            info!(
+                                "transferBond confirmed: tx_hash={:?} status={:?} block={:?} gas_used={:?} round={}",
+                                receipt.transaction_hash,
+                                receipt.status,
+                                receipt.block_number,
+                                receipt.gas_used,
+                                current_round
+                            );
+                        }
+                        Ok(Ok(None)) => {
+                            warn!(
+                                "transferBond receipt missing (None): tx_hash={:?} round={}",
+                                tx_hash, current_round
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            warn!(
+                                "transferBond receipt error: tx_hash={:?} err={} round={}",
+                                tx_hash, e, current_round
+                            );
+                        }
+                        Err(_) => {
+                            warn!(
+                                "transferBond receipt timeout after {}s: tx_hash={:?} round={}",
+                                cfg.receipt_timeout_secs, tx_hash, current_round
+                            );
+                        }
                     }
-                    Ok(Ok(None)) => warn!(
-                        "transferBond pending returned None receipt: tx_hash={:?}",
-                        tx_hash
-                    ),
-                    Ok(Err(e)) => {
-                        warn!("transferBond receipt error: tx_hash={:?} err={e}", tx_hash)
-                    }
-                    Err(_) => warn!(
-                        "transferBond receipt timeout after {}s: tx_hash={:?}",
-                        cfg.receipt_timeout_secs, tx_hash
-                    ),
+                }
+                Err(e) => {
+                    warn!(
+                        "transferBond send failed: err={} to_receiver={:?} amountWei={} round={}",
+                        e, receiver, transferable, current_round
+                    );
                 }
             }
-            Err(e) => warn!("transferBond send failed: {e}"),
         }
     }
 
-    // ---- withdrawFees ----
-    if pending_fees >= cfg.eth_fee_withdraw_threshold_wei && !pending_fees.is_zero() {
+    // ----------------------------
+    // withdrawFees (optional)
+    // ----------------------------
+    if cfg.enable_withdraw_fees {
+        let receiver = cfg.eth_fee_receiver_addr.expect("validated at startup");
+        let threshold = cfg
+            .eth_fee_withdraw_threshold_wei
+            .expect("validated at startup");
+        let pending_fees = bonding
+            .pending_fees(orchestrator, current_round)
+            .call()
+            .await
+            .map_err(|e| AppError::Contract(format!("pendingFees() failed: {e}")))?;
+
         info!(
-            "withdrawFees sending: from_orchestrator={:?} to_receiver={:?} amountWei={}",
-            orchestrator, cfg.eth_fee_receiver_addr, pending_fees
+            "locked withdrawFees check: round={} pendingFeesWei={} thresholdWei={}",
+            current_round, pending_fees, threshold
         );
 
-        let call = bonding.withdraw_fees(cfg.eth_fee_receiver_addr, pending_fees);
-        match call.send().await {
-            Ok(pending) => {
-                let tx_hash: TxHash = *pending;
-                info!("withdrawFees tx sent: tx_hash={:?}", tx_hash);
+        if pending_fees >= threshold && !pending_fees.is_zero() {
+            info!(
+                "withdrawFees sending: from_orchestrator={:?} to_receiver={:?} amountWei={} round={}",
+                orchestrator, receiver, pending_fees, current_round
+            );
 
-                match timeout(Duration::from_secs(cfg.receipt_timeout_secs), pending).await {
-                    Ok(Ok(Some(receipt))) => {
-                        info!(
-                            "withdrawFees confirmed: tx_hash={:?} status={:?} block={:?} gas_used={:?}",
-                            receipt.transaction_hash,
-                            receipt.status,
-                            receipt.block_number,
-                            receipt.gas_used
-                        );
-                    }
-                    Ok(Ok(None)) => {
-                        warn!(
-                            "withdrawFees pending returned None receipt: tx_hash={:?}",
-                            tx_hash
-                        );
-                    }
-                    Ok(Err(e)) => {
-                        warn!("withdrawFees receipt error: tx_hash={:?} err={e}", tx_hash);
-                    }
-                    Err(_) => {
-                        warn!(
-                            "withdrawFees receipt timeout after {}s: tx_hash={:?}",
-                            cfg.receipt_timeout_secs, tx_hash
-                        );
+            let call = bonding.withdraw_fees(receiver, pending_fees);
+
+            match call.send().await {
+                Ok(pending) => {
+                    let tx_hash = *pending;
+                    info!(
+                        "withdrawFees tx sent: tx_hash={:?} round={}",
+                        tx_hash, current_round
+                    );
+
+                    match timeout(Duration::from_secs(cfg.receipt_timeout_secs), pending).await {
+                        Ok(Ok(Some(receipt))) => {
+                            info!(
+                                "withdrawFees confirmed: tx_hash={:?} status={:?} block={:?} gas_used={:?} round={}",
+                                receipt.transaction_hash,
+                                receipt.status,
+                                receipt.block_number,
+                                receipt.gas_used,
+                                current_round
+                            );
+                        }
+                        Ok(Ok(None)) => {
+                            warn!(
+                                "withdrawFees receipt missing (None): tx_hash={:?} round={}",
+                                tx_hash, current_round
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            warn!(
+                                "withdrawFees receipt error: tx_hash={:?} err={} round={}",
+                                tx_hash, e, current_round
+                            );
+                        }
+                        Err(_) => {
+                            warn!(
+                                "withdrawFees receipt timeout after {}s: tx_hash={:?} round={}",
+                                cfg.receipt_timeout_secs, tx_hash, current_round
+                            );
+                        }
                     }
                 }
+                Err(e) => {
+                    warn!(
+                        "withdrawFees send failed: err={} to_receiver={:?} amountWei={} round={}",
+                        e, receiver, pending_fees, current_round
+                    );
+                }
             }
-            Err(e) => {
-                warn!("withdrawFees send failed: {e}");
-            }
+        } else {
+            debug!(
+                "withdrawFees skipped: pendingFeesWei={} < thresholdWei={} round={}",
+                pending_fees, threshold, current_round
+            );
         }
-    } else {
-        debug!(
-            "withdrawFees not needed: pendingFeesWei={} < thresholdWei={}",
-            pending_fees, cfg.eth_fee_withdraw_threshold_wei
-        );
     }
 
     Ok(())
@@ -418,6 +481,10 @@ fn init_logging() {
 }
 
 fn load_config() -> Result<Config, AppError> {
+    let enable_reward = parse_env_bool_opt("ENABLE_REWARD")?.unwrap_or(true);
+    let enable_transfer_bond = parse_env_bool_opt("ENABLE_TRANSFER_BOND")?.unwrap_or(true);
+    let enable_withdraw_fees = parse_env_bool_opt("ENABLE_WITHDRAW_FEES")?.unwrap_or(true);
+
     let http_rpc_url = must_env("HTTP_RPC_URL")?;
     let chain_id = must_parse_env_u64("CHAIN_ID")?;
 
@@ -431,11 +498,23 @@ fn load_config() -> Result<Config, AppError> {
     let loop_sleep_secs = parse_env_u64_opt("LOOP_SLEEP_SECS")?.unwrap_or(6);
     let receipt_timeout_secs = parse_env_u64_opt("RECEIPT_TIMEOUT_SECS")?.unwrap_or(90);
 
-    let lpt_receiver_addr = must_parse_env_addr("LPT_RECEIVER_ADDR")?;
-    let lpt_min_retain_wei = must_parse_env_u256("LPT_MIN_RETAIN_WEI")?;
+    let (lpt_receiver_addr, lpt_min_retain_wei) = if enable_transfer_bond {
+        (
+            Some(must_parse_env_addr("LPT_RECEIVER_ADDR")?),
+            Some(must_parse_env_u256("LPT_MIN_RETAIN_WEI")?),
+        )
+    } else {
+        (None, None)
+    };
 
-    let eth_fee_receiver_addr = must_parse_env_addr("ETH_FEE_RECEIVER_ADDR")?;
-    let eth_fee_withdraw_threshold_wei = must_parse_env_u256("ETH_FEE_WITHDRAW_THRESHOLD_WEI")?;
+    let (eth_fee_receiver_addr, eth_fee_withdraw_threshold_wei) = if enable_withdraw_fees {
+        (
+            Some(must_parse_env_addr("ETH_FEE_RECEIVER_ADDR")?),
+            Some(must_parse_env_u256("ETH_FEE_WITHDRAW_THRESHOLD_WEI")?),
+        )
+    } else {
+        (None, None)
+    };
 
     Ok(Config {
         http_rpc_url,
@@ -447,11 +526,48 @@ fn load_config() -> Result<Config, AppError> {
         orchestrator_addr,
         loop_sleep_secs,
         receipt_timeout_secs,
+        enable_reward,
+        enable_transfer_bond,
         lpt_receiver_addr,
         lpt_min_retain_wei,
+        enable_withdraw_fees,
         eth_fee_receiver_addr,
         eth_fee_withdraw_threshold_wei,
     })
+}
+
+fn validate_config(cfg: &Config) -> Result<(), AppError> {
+    if cfg.enable_transfer_bond {
+        if cfg.lpt_receiver_addr.is_none() {
+            return Err(AppError::BadEnv(
+                "LPT_RECEIVER_ADDR",
+                "required when ENABLE_TRANSFER_BOND=true".into(),
+            ));
+        }
+        if cfg.lpt_min_retain_wei.is_none() {
+            return Err(AppError::BadEnv(
+                "LPT_MIN_RETAIN_WEI",
+                "required when ENABLE_TRANSFER_BOND=true".into(),
+            ));
+        }
+    }
+
+    if cfg.enable_withdraw_fees {
+        if cfg.eth_fee_receiver_addr.is_none() {
+            return Err(AppError::BadEnv(
+                "ETH_FEE_RECEIVER_ADDR",
+                "required when ENABLE_WITHDRAW_FEES=true".into(),
+            ));
+        }
+        if cfg.eth_fee_withdraw_threshold_wei.is_none() {
+            return Err(AppError::BadEnv(
+                "ETH_FEE_WITHDRAW_THRESHOLD_WEI",
+                "required when ENABLE_WITHDRAW_FEES=true".into(),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn must_env(key: &'static str) -> Result<String, AppError> {
@@ -498,4 +614,23 @@ fn must_parse_env_u256(key: &'static str) -> Result<U256, AppError> {
     let s = must_env(key)?;
     // Accept decimal strings
     U256::from_dec_str(&s).map_err(|e| AppError::BadEnv(key, format!("{e}")))
+}
+
+fn parse_env_bool_opt(key: &'static str) -> Result<Option<bool>, AppError> {
+    match env::var(key) {
+        Ok(raw) => {
+            let v = match raw.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "y" | "on" => true,
+                "0" | "false" | "no" | "n" | "off" => false,
+                _ => {
+                    return Err(AppError::BadEnv(
+                        key,
+                        "expected boolean (true/false)".into(),
+                    ));
+                }
+            };
+            Ok(Some(v))
+        }
+        Err(_) => Ok(None),
+    }
 }

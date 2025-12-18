@@ -1,6 +1,6 @@
 services:
   funds-transfer:
-    image: tztcloud/livepeer-funds-transfer:0.0.3
+    image: tztcloud/livepeer-funds-transfer:0.0.4
     container_name: "funds-transfer"
     hostname: "funds-transfer"
     restart: unless-stopped
@@ -32,9 +32,15 @@ services:
       LOOP_SLEEP_SECS: "60"
       RECEIPT_TIMEOUT_SECS: "90"
 
+      ############################################
+      # Reward Call SETTINGS
+      ############################################
+      ENABLE_REWARD: "true"
+
       # -----------------------------
       # LPT BOND TRANSFER
       # -----------------------------
+      ENABLE_TRANSFER_BOND: "true"
       # Minimum bonded LPT to keep on orchestrator (wei)
       LPT_MIN_RETAIN_WEI: "1000000000000000000" # 1 LPT
 
@@ -44,6 +50,7 @@ services:
       # -----------------------------
       # FEE WITHDRAWAL
       # -----------------------------
+      ENABLE_WITHDRAW_FEES: "true"
       ETH_FEE_WITHDRAW_THRESHOLD_WEI: "1000000000000000" # 0.001 ETH
       ETH_FEE_RECEIVER_ADDR: "0xYourFeeRecipientAddress"
 
