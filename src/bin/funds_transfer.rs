@@ -84,6 +84,15 @@ struct RoundState {
     locked: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LockedSnapshot {
+    round: U256,
+    pending_stake: U256,
+    pending_fees: U256,
+    stake_present: bool,
+    fees_present: bool,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging();
@@ -92,15 +101,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     validate_config(&cfg)?;
 
     info!(
-        "starting funds_transfer with cfg: chain_id={}, rounds_manager={:?}, bonding_manager={:?}, loop_sleep_secs={}",
-        cfg.chain_id, cfg.rounds_manager_addr, cfg.bonding_manager_addr, cfg.loop_sleep_secs
+        "starting funds_transfer: chain_id={} rounds_manager={:?} bonding_manager={:?} sleep_secs={} flags(reward={}, transfer_bond={}, withdraw_fees={})",
+        cfg.chain_id,
+        cfg.rounds_manager_addr,
+        cfg.bonding_manager_addr,
+        cfg.loop_sleep_secs,
+        cfg.enable_reward,
+        cfg.enable_transfer_bond,
+        cfg.enable_withdraw_fees
     );
 
     let provider = Provider::<Http>::try_from(cfg.http_rpc_url.as_str())
         .map_err(|e| AppError::Provider(format!("{e}")))?;
-    // Small internal polling interval for provider housekeeping
+    // internal polling interval for provider housekeeping
     let provider = provider.interval(Duration::from_millis(250));
 
+    // load wallet (keystore + passphrase files)
     let passphrase = std::fs::read_to_string(&cfg.passphrase_file)
         .map_err(|e| AppError::Wallet(format!("failed to read PASSPHRASE_FILE: {e}")))?;
     let passphrase = passphrase.trim_end();
@@ -110,25 +126,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| AppError::Wallet(format!("failed to decrypt JSON_KEY_FILE: {e}")))?
         .with_chain_id(cfg.chain_id);
 
-    let derived_addr = wallet.address();
-    let orchestrator_addr = cfg.orchestrator_addr.unwrap_or(derived_addr);
+    let signer_addr = wallet.address();
+    let orchestrator_addr = cfg.orchestrator_addr.unwrap_or(signer_addr);
 
-    if orchestrator_addr != derived_addr {
+    if orchestrator_addr != signer_addr {
         warn!(
-            "ORCHESTRATOR_ADDR differs from PRIVATE_KEY derived address; using ORCHESTRATOR_ADDR={:?}, signer={:?}",
-            orchestrator_addr, derived_addr
+            "ORCHESTRATOR_ADDR differs from signer address; using orchestrator={:?} signer={:?}",
+            orchestrator_addr, signer_addr
         );
     } else {
         info!("orchestrator/signer address: {:?}", orchestrator_addr);
     }
 
     let client = Arc::new(SignerMiddleware::new(provider, wallet));
-
     let rounds = RoundsManager::new(cfg.rounds_manager_addr, client.clone());
     let bonding = BondingManager::new(cfg.bonding_manager_addr, client.clone());
 
-    // Cache last seen round state for transition logging
     let mut last_state: Option<RoundState> = None;
+    let mut last_locked_snapshot: Option<LockedSnapshot> = None;
 
     loop {
         let state = match fetch_round_state(&rounds).await {
@@ -140,16 +155,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        if last_state
-            .map(|ls| {
-                ls.round != state.round
-                    || ls.initialized != state.initialized
-                    || ls.locked != state.locked
-            })
-            .unwrap_or(true)
-        {
+        let state_changed = last_state.map(|ls| ls != state).unwrap_or(true);
+        if state_changed {
             info!(
-                "round state: round={} initialized={} locked={}",
+                "round state changed: round={} initialized={} locked={}",
                 state.round, state.initialized, state.locked
             );
         } else {
@@ -160,28 +169,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // 1) When initialized: reward() once per round
-        if cfg.enable_reward
-            && state.initialized
-            && let Err(e) = maybe_reward_once_per_round(
+        if cfg.enable_reward && state.initialized {
+            if let Err(e) = maybe_reward_once_per_round(
                 &bonding,
                 orchestrator_addr,
                 state.round,
                 cfg.receipt_timeout_secs,
             )
             .await
-        {
-            // No internal retry: log and let next loop try again
-            warn!("reward check/tx failed: {e}; will retry next loop if still needed");
+            {
+                // no internal retries: next loop will re-check and retry if still needed
+                warn!("reward check/tx failed: {e}; will retry next loop if still needed");
+            }
         }
 
         // 2) When locked: transferBond + withdrawFees
-        let any_locked_feature = cfg.enable_transfer_bond || cfg.enable_withdraw_fees;
-        if any_locked_feature
-            && state.locked
-            && let Err(e) =
-                handle_locked_round_actions(&bonding, orchestrator_addr, state.round, &cfg).await
-        {
-            warn!("locked-round actions failed: {e}; will retry next loop if still needed");
+        if (cfg.enable_transfer_bond || cfg.enable_withdraw_fees) && state.locked {
+            if let Err(e) = handle_locked_round_actions(
+                &bonding,
+                orchestrator_addr,
+                state.round,
+                &cfg,
+                &mut last_locked_snapshot,
+            )
+            .await
+            {
+                warn!("locked-round actions failed: {e}; will retry next loop if still needed");
+            }
         }
 
         last_state = Some(state);
@@ -287,19 +301,32 @@ async fn handle_locked_round_actions<M: Middleware>(
     orchestrator: Address,
     current_round: U256,
     cfg: &Config,
+    last_locked_snapshot: &mut Option<LockedSnapshot>,
 ) -> Result<(), AppError> {
-    // If both features are disabled, nothing to do.
     if !cfg.enable_transfer_bond && !cfg.enable_withdraw_fees {
         debug!("locked-round actions skipped: both transferBond and withdrawFees are disabled");
         return Ok(());
     }
 
+    let mut pending_stake_for_snapshot: Option<U256> = None;
+    let mut pending_fees_for_snapshot: Option<U256> = None;
+
     // ----------------------------
     // transferBond (optional)
     // ----------------------------
     if cfg.enable_transfer_bond {
-        let receiver = cfg.lpt_receiver_addr.expect("validated at startup");
-        let retain = cfg.lpt_min_retain_wei.expect("validated at startup");
+        let receiver = cfg.lpt_receiver_addr.ok_or_else(|| {
+            AppError::BadEnv(
+                "LPT_RECEIVER_ADDR",
+                "required when ENABLE_TRANSFER_BOND=true".into(),
+            )
+        })?;
+        let retain = cfg.lpt_min_retain_wei.ok_or_else(|| {
+            AppError::BadEnv(
+                "LPT_MIN_RETAIN_WEI",
+                "required when ENABLE_TRANSFER_BOND=true".into(),
+            )
+        })?;
 
         let pending_stake = bonding
             .pending_stake(orchestrator, current_round)
@@ -307,18 +334,20 @@ async fn handle_locked_round_actions<M: Middleware>(
             .await
             .map_err(|e| AppError::Contract(format!("pendingStake() failed: {e}")))?;
 
-        info!(
-            "locked transferBond check: round={} pendingStakeWei={} retainWei={}",
+        pending_stake_for_snapshot = Some(pending_stake);
+
+        // Keep check logs at DEBUG to avoid redundant INFO spam.
+        debug!(
+            "transferBond check: round={} pendingStakeWei={} retainWei={}",
             current_round, pending_stake, retain
         );
 
-        // Transfer all excess above retain. If <= retain, skip.
         let transferable = match pending_stake.checked_sub(retain) {
             Some(v) if !v.is_zero() => v,
             _ => {
                 debug!(
-                    "transferBond skipped: pendingStakeWei={} <= retainWei={}",
-                    pending_stake, retain
+                    "transferBond skipped: pendingStakeWei={} <= retainWei={} round={}",
+                    pending_stake, retain, current_round
                 );
                 U256::zero()
             }
@@ -326,8 +355,8 @@ async fn handle_locked_round_actions<M: Middleware>(
 
         if !transferable.is_zero() {
             info!(
-                "transferBond sending: from_orchestrator={:?} to_receiver={:?} amountWei={} round={}",
-                orchestrator, receiver, transferable, current_round
+                "transferBond sending: round={} from_orchestrator={:?} to_receiver={:?} amountWei={}",
+                current_round, orchestrator, receiver, transferable
             );
 
             let call = bonding.transfer_bond(
@@ -343,45 +372,45 @@ async fn handle_locked_round_actions<M: Middleware>(
                 Ok(pending) => {
                     let tx_hash = *pending;
                     info!(
-                        "transferBond tx sent: tx_hash={:?} round={}",
-                        tx_hash, current_round
+                        "transferBond tx sent: round={} tx_hash={:?}",
+                        current_round, tx_hash
                     );
 
                     match timeout(Duration::from_secs(cfg.receipt_timeout_secs), pending).await {
                         Ok(Ok(Some(receipt))) => {
                             info!(
-                                "transferBond confirmed: tx_hash={:?} status={:?} block={:?} gas_used={:?} round={}",
+                                "transferBond confirmed: round={} tx_hash={:?} status={:?} block={:?} gas_used={:?}",
+                                current_round,
                                 receipt.transaction_hash,
                                 receipt.status,
                                 receipt.block_number,
-                                receipt.gas_used,
-                                current_round
+                                receipt.gas_used
                             );
                         }
                         Ok(Ok(None)) => {
                             warn!(
-                                "transferBond receipt missing (None): tx_hash={:?} round={}",
-                                tx_hash, current_round
+                                "transferBond receipt missing (None): round={} tx_hash={:?}",
+                                current_round, tx_hash
                             );
                         }
                         Ok(Err(e)) => {
                             warn!(
-                                "transferBond receipt error: tx_hash={:?} err={} round={}",
-                                tx_hash, e, current_round
+                                "transferBond receipt error: round={} tx_hash={:?} err={}",
+                                current_round, tx_hash, e
                             );
                         }
                         Err(_) => {
                             warn!(
-                                "transferBond receipt timeout after {}s: tx_hash={:?} round={}",
-                                cfg.receipt_timeout_secs, tx_hash, current_round
+                                "transferBond receipt timeout after {}s: round={} tx_hash={:?}",
+                                cfg.receipt_timeout_secs, current_round, tx_hash
                             );
                         }
                     }
                 }
                 Err(e) => {
                     warn!(
-                        "transferBond send failed: err={} to_receiver={:?} amountWei={} round={}",
-                        e, receiver, transferable, current_round
+                        "transferBond send failed: round={} to_receiver={:?} amountWei={} err={}",
+                        current_round, receiver, transferable, e
                     );
                 }
             }
@@ -392,25 +421,36 @@ async fn handle_locked_round_actions<M: Middleware>(
     // withdrawFees (optional)
     // ----------------------------
     if cfg.enable_withdraw_fees {
-        let receiver = cfg.eth_fee_receiver_addr.expect("validated at startup");
-        let threshold = cfg
-            .eth_fee_withdraw_threshold_wei
-            .expect("validated at startup");
+        let receiver = cfg.eth_fee_receiver_addr.ok_or_else(|| {
+            AppError::BadEnv(
+                "ETH_FEE_RECEIVER_ADDR",
+                "required when ENABLE_WITHDRAW_FEES=true".into(),
+            )
+        })?;
+        let threshold = cfg.eth_fee_withdraw_threshold_wei.ok_or_else(|| {
+            AppError::BadEnv(
+                "ETH_FEE_WITHDRAW_THRESHOLD_WEI",
+                "required when ENABLE_WITHDRAW_FEES=true".into(),
+            )
+        })?;
+
         let pending_fees = bonding
             .pending_fees(orchestrator, current_round)
             .call()
             .await
             .map_err(|e| AppError::Contract(format!("pendingFees() failed: {e}")))?;
 
-        info!(
-            "locked withdrawFees check: round={} pendingFeesWei={} thresholdWei={}",
+        pending_fees_for_snapshot = Some(pending_fees);
+
+        debug!(
+            "withdrawFees check: round={} pendingFeesWei={} thresholdWei={}",
             current_round, pending_fees, threshold
         );
 
         if pending_fees >= threshold && !pending_fees.is_zero() {
             info!(
-                "withdrawFees sending: from_orchestrator={:?} to_receiver={:?} amountWei={} round={}",
-                orchestrator, receiver, pending_fees, current_round
+                "withdrawFees sending: round={} from_orchestrator={:?} to_receiver={:?} amountWei={}",
+                current_round, orchestrator, receiver, pending_fees
             );
 
             let call = bonding.withdraw_fees(receiver, pending_fees);
@@ -419,68 +459,141 @@ async fn handle_locked_round_actions<M: Middleware>(
                 Ok(pending) => {
                     let tx_hash = *pending;
                     info!(
-                        "withdrawFees tx sent: tx_hash={:?} round={}",
-                        tx_hash, current_round
+                        "withdrawFees tx sent: round={} tx_hash={:?}",
+                        current_round, tx_hash
                     );
 
                     match timeout(Duration::from_secs(cfg.receipt_timeout_secs), pending).await {
                         Ok(Ok(Some(receipt))) => {
                             info!(
-                                "withdrawFees confirmed: tx_hash={:?} status={:?} block={:?} gas_used={:?} round={}",
+                                "withdrawFees confirmed: round={} tx_hash={:?} status={:?} block={:?} gas_used={:?}",
+                                current_round,
                                 receipt.transaction_hash,
                                 receipt.status,
                                 receipt.block_number,
-                                receipt.gas_used,
-                                current_round
+                                receipt.gas_used
                             );
                         }
                         Ok(Ok(None)) => {
                             warn!(
-                                "withdrawFees receipt missing (None): tx_hash={:?} round={}",
-                                tx_hash, current_round
+                                "withdrawFees receipt missing (None): round={} tx_hash={:?}",
+                                current_round, tx_hash
                             );
                         }
                         Ok(Err(e)) => {
                             warn!(
-                                "withdrawFees receipt error: tx_hash={:?} err={} round={}",
-                                tx_hash, e, current_round
+                                "withdrawFees receipt error: round={} tx_hash={:?} err={}",
+                                current_round, tx_hash, e
                             );
                         }
                         Err(_) => {
                             warn!(
-                                "withdrawFees receipt timeout after {}s: tx_hash={:?} round={}",
-                                cfg.receipt_timeout_secs, tx_hash, current_round
+                                "withdrawFees receipt timeout after {}s: round={} tx_hash={:?}",
+                                cfg.receipt_timeout_secs, current_round, tx_hash
                             );
                         }
                     }
                 }
                 Err(e) => {
                     warn!(
-                        "withdrawFees send failed: err={} to_receiver={:?} amountWei={} round={}",
-                        e, receiver, pending_fees, current_round
+                        "withdrawFees send failed: round={} to_receiver={:?} amountWei={} err={}",
+                        current_round, receiver, pending_fees, e
                     );
                 }
             }
         } else {
             debug!(
-                "withdrawFees skipped: pendingFeesWei={} < thresholdWei={} round={}",
-                pending_fees, threshold, current_round
+                "withdrawFees skipped: round={} pendingFeesWei={} < thresholdWei={}",
+                current_round, pending_fees, threshold
             );
         }
+    }
+
+    // Emit a single INFO snapshot when the locked-round values change (not every loop).
+    let snap = LockedSnapshot {
+        round: current_round,
+        pending_stake: pending_stake_for_snapshot.unwrap_or_else(U256::zero),
+        pending_fees: pending_fees_for_snapshot.unwrap_or_else(U256::zero),
+        stake_present: pending_stake_for_snapshot.is_some(),
+        fees_present: pending_fees_for_snapshot.is_some(),
+    };
+
+    if *last_locked_snapshot != Some(snap) {
+        if snap.stake_present && snap.fees_present {
+            info!(
+                "locked snapshot changed: round={} pendingStakeWei={} pendingFeesWei={}",
+                snap.round, snap.pending_stake, snap.pending_fees
+            );
+        } else if snap.stake_present {
+            info!(
+                "locked snapshot changed: round={} pendingStakeWei={}",
+                snap.round, snap.pending_stake
+            );
+        } else if snap.fees_present {
+            info!(
+                "locked snapshot changed: round={} pendingFeesWei={}",
+                snap.round, snap.pending_fees
+            );
+        } else {
+            info!("locked snapshot changed: round={}", snap.round);
+        }
+
+        *last_locked_snapshot = Some(snap);
+    } else {
+        debug!(
+            "locked snapshot unchanged: round={} stake_present={} fees_present={}",
+            snap.round, snap.stake_present, snap.fees_present
+        );
     }
 
     Ok(())
 }
 
 fn init_logging() {
-    // Respect RUST_LOG if set
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let filter = match tracing_subscriber::EnvFilter::try_from_default_env() {
+        Ok(f) => f,
+        Err(_) => tracing_subscriber::EnvFilter::new("info"),
+    };
 
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
+fn validate_config(cfg: &Config) -> Result<(), AppError> {
+    if cfg.enable_transfer_bond {
+        if cfg.lpt_receiver_addr.is_none() {
+            return Err(AppError::BadEnv(
+                "LPT_RECEIVER_ADDR",
+                "required when ENABLE_TRANSFER_BOND=true".into(),
+            ));
+        }
+        if cfg.lpt_min_retain_wei.is_none() {
+            return Err(AppError::BadEnv(
+                "LPT_MIN_RETAIN_WEI",
+                "required when ENABLE_TRANSFER_BOND=true".into(),
+            ));
+        }
+    }
+
+    if cfg.enable_withdraw_fees {
+        if cfg.eth_fee_receiver_addr.is_none() {
+            return Err(AppError::BadEnv(
+                "ETH_FEE_RECEIVER_ADDR",
+                "required when ENABLE_WITHDRAW_FEES=true".into(),
+            ));
+        }
+        if cfg.eth_fee_withdraw_threshold_wei.is_none() {
+            return Err(AppError::BadEnv(
+                "ETH_FEE_WITHDRAW_THRESHOLD_WEI",
+                "required when ENABLE_WITHDRAW_FEES=true".into(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn load_config() -> Result<Config, AppError> {
+    // feature flags: default to current behavior (enabled) if not specified
     let enable_reward = parse_env_bool_opt("ENABLE_REWARD")?.unwrap_or(true);
     let enable_transfer_bond = parse_env_bool_opt("ENABLE_TRANSFER_BOND")?.unwrap_or(true);
     let enable_withdraw_fees = parse_env_bool_opt("ENABLE_WITHDRAW_FEES")?.unwrap_or(true);
@@ -528,46 +641,12 @@ fn load_config() -> Result<Config, AppError> {
         receipt_timeout_secs,
         enable_reward,
         enable_transfer_bond,
+        enable_withdraw_fees,
         lpt_receiver_addr,
         lpt_min_retain_wei,
-        enable_withdraw_fees,
         eth_fee_receiver_addr,
         eth_fee_withdraw_threshold_wei,
     })
-}
-
-fn validate_config(cfg: &Config) -> Result<(), AppError> {
-    if cfg.enable_transfer_bond {
-        if cfg.lpt_receiver_addr.is_none() {
-            return Err(AppError::BadEnv(
-                "LPT_RECEIVER_ADDR",
-                "required when ENABLE_TRANSFER_BOND=true".into(),
-            ));
-        }
-        if cfg.lpt_min_retain_wei.is_none() {
-            return Err(AppError::BadEnv(
-                "LPT_MIN_RETAIN_WEI",
-                "required when ENABLE_TRANSFER_BOND=true".into(),
-            ));
-        }
-    }
-
-    if cfg.enable_withdraw_fees {
-        if cfg.eth_fee_receiver_addr.is_none() {
-            return Err(AppError::BadEnv(
-                "ETH_FEE_RECEIVER_ADDR",
-                "required when ENABLE_WITHDRAW_FEES=true".into(),
-            ));
-        }
-        if cfg.eth_fee_withdraw_threshold_wei.is_none() {
-            return Err(AppError::BadEnv(
-                "ETH_FEE_WITHDRAW_THRESHOLD_WEI",
-                "required when ENABLE_WITHDRAW_FEES=true".into(),
-            ));
-        }
-    }
-
-    Ok(())
 }
 
 fn must_env(key: &'static str) -> Result<String, AppError> {

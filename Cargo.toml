@@ -1,6 +1,6 @@
 [package]
 name = "livepeer-funds-transfer"
-version = "0.0.3"
+version = "0.0.5"
 edition = "2024"
 publish = false
 
