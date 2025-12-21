@@ -335,10 +335,9 @@ This reduces the final image size significantly (from ~2GB to ~100MB).
 The application provides detailed logging at various levels:
 
 ```
-2025-12-17T22:35:27.527313Z  INFO funds_transfer: starting funds_transfer with cfg: chain_id=42161, rounds_manager=0xdd6f56dcc28d3f5f27084381fe8df634985cc39f, bonding_manager=0x35bcf3c30594191d53231e4ff333e8a770453e40, loop_sleep_secs=60
-2025-12-17T22:35:28.253717Z  INFO funds_transfer: orchestrator/signer address: 0xYourOrchestratorAddress
-2025-12-17T22:35:28.564762Z  INFO funds_transfer: round state: round=4032 initialized=true locked=false
-2025-12-17T22:35:28.612253Z DEBUG funds_transfer: reward not needed: lastRewardRound=4032 currentRound=4032
+2025-12-20T14:40:54.859032Z  INFO funds_transfer: starting funds_transfer: chain_id=42161 rounds_manager=0xdd6f56dcc28d3f5f27084381fe8df634985cc39f bonding_manager=0x35bcf3c30594191d53231e4ff333e8a770453e40 sleep_secs=60 flags(reward=true, transfer_bond=true, withdraw_fees=true)
+2025-12-20T14:40:55.527227Z  INFO funds_transfer: orchestrator/signer address: 0xYourOrchAddress
+2025-12-20T14:40:55.756562Z  INFO funds_transfer: round state changed: round=4035 initialized=true locked=false
 ```
 
 #### Viewing Logs
@@ -372,28 +371,14 @@ Monitor for:
 
 #### Scenario 1: Normal Operation
 ```
-[INFO] Current Round [1234] is locked
-[INFO] Total stake [10.5] ETH
-[INFO] Stake ready for transfer [9500000000000000000] WEI
-[INFO] Transfer Bond Transaction sent successfully. Hash: 0xabc...
-[INFO] Pending fees [0.05] Threshold to withdraw [0.03]
-[INFO] Fees ready for transfer [0.05] ETH
-[INFO] Withdraw Fees Transaction sent successfully. Hash: 0xdef...
+2025-12-20T18:29:38.310281Z  INFO funds_transfer: round state changed: round=4035 initialized=true locked=true
+2025-12-20T18:29:38.404593Z  INFO funds_transfer: transferBond sending: round=4035 from_orchestrator=0xYourOrchAddress to_receiver=0xYourStakeOrTreasuryAddress amountWei=1083763440135192443657
+2025-12-20T18:29:39.201740Z  INFO funds_transfer: transferBond tx sent: round=4035 tx_hash=0xc5....
+2025-12-20T18:29:39.541239Z  INFO funds_transfer: transferBond confirmed: round=4035 tx_hash=0xc5... status=Some(1) block=Some(412709680) gas_used=Some(532629)
+2025-12-20T18:29:39.587134Z  INFO funds_transfer: withdrawFees sending: round=4035 from_orchestrator=0xYourOrchAddress to_receiver=0xYourFeeRecipientAddress amountWei=7200000000000000
+2025-12-20T18:29:40.193946Z  INFO funds_transfer: withdrawFees tx sent: round=4035 tx_hash=0x93eec...
+2025-12-20T18:29:40.529429Z  INFO funds_transfer: withdrawFees confirmed: round=4035 tx_hash=0x93eec... status=Some(1) block=Some(412709684) gas_used=Some(153100)
 ```
-
-#### Scenario 2: Insufficient Balance
-```
-[INFO] Current Round [1234] is locked
-[INFO] Total stake [0.8] ETH
-[INFO] Pending fees [0.02] Threshold to withdraw [0.03]
-```
-No transactions executed - waiting for thresholds to be met.
-
-#### Scenario 3: Round Not Locked
-```
-[INFO] Current Round [1234] is not locked. No transfers until the round is locked.
-```
-Application waits 30 minutes and checks again.
 
 ## Security Considerations
 
@@ -448,11 +433,11 @@ Application waits 30 minutes and checks again.
 
 ### Common Issues
 
-#### 1. "RPC_ENDPOINT_URL missing"
+#### 1. "HTTP_RPC_URL missing"
 **Cause**: Environment variable not set
 **Solution**: 
 ```bash
-export RPC_ENDPOINT_URL=https://arb1.arbitrum.io/rpc
+export HTTP_RPC_URL=https://arb1.arbitrum.io/rpc
 # Or add to .env file
 ```
 
@@ -510,35 +495,16 @@ To test configuration without executing real transactions, you can:
 
 1. Check application logs first
 2. Verify all environment variables are set correctly
-3. Test RPC connectivity: `curl -X POST $RPC_ENDPOINT_URL -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'`
+3. Test RPC connectivity: `curl -X POST $HTTP_RPC_URL -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'`
 4. Verify wallet address has necessary permissions in Livepeer protocol
 5. Review Livepeer Protocol documentation for round and staking mechanics
-
-## Advanced Configuration
-
-### Modifying Operational Parameters
-
-Edit `src/bin/funds_transfer.rs`:
-
-```rust
-// Change fee withdrawal threshold (default 0.03 ETH)
-let pending_fee_threshold = 0.05;
-
-// Change polling interval (default 1800 seconds / 30 minutes)
-let sleep_timer_secs = 3600; // 1 hour
-
-// Change reserve LPT (default 1.0 LPT)
-let lpt_to_transfer_bond = orch_pending_stake_wei - (2 * one_eth_in_wei);
-```
-
-After modifications, rebuild the application.
 
 ### Using Alternative Networks
 
 For Arbitrum Sepolia testnet:
 ```bash
 CHAIN_ID=421614
-RPC_ENDPOINT_URL=https://sepolia-rollup.arbitrum.io/rpc
+HTTP_RPC_URL=https://sepolia-rollup.arbitrum.io/rpc
 ```
 
 Update contract addresses in code if different on testnet.
@@ -552,7 +518,7 @@ Update contract addresses in code if different on testnet.
 
 ## License
 
-[Specify your license here]
+MIT
 
 ## Contributing
 
@@ -564,10 +530,6 @@ For issues related to:
 - **This application**: [Create an issue in the repository]
 - **Livepeer Protocol**: Visit [Livepeer Discord](https://discord.gg/livepeer)
 - **Arbitrum Network**: Visit [Arbitrum Discord](https://discord.gg/arbitrum)
-
-## Version History
-
-- **0.0.1**: Initial release with basic bond transfer and fee withdrawal functionality
 
 ---
 

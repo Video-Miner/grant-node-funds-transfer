@@ -1,6 +1,6 @@
 services:
   funds-transfer:
-    image: tztcloud/livepeer-funds-transfer:0.0.4
+    image: tztcloud/livepeer-funds-transfer:0.0.5
     container_name: "funds-transfer"
     hostname: "funds-transfer"
     restart: unless-stopped
