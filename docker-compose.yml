@@ -1,0 +1,65 @@
+services:
+  funds-transfer:
+    image: tztcloud/livepeer-funds-transfer:0.0.5
+    container_name: "funds-transfer"
+    hostname: "funds-transfer"
+    restart: unless-stopped
+    environment:
+      # -----------------------------
+      # RPC / CHAIN
+      # -----------------------------
+      HTTP_RPC_URL: "https://arb1.arbitrum.io/rpc"
+      CHAIN_ID: "42161"
+
+      # -----------------------------
+      # CONTRACT ADDRESSES
+      # -----------------------------
+      ROUNDS_MANAGER_ADDR: "0xdd6f56DcC28D3F5f27084381fE8Df634985cc39f"
+      BONDING_MANAGER_ADDR: "0x35Bcf3c30594191d53231E4FF333E8A770453e40"
+
+      # -----------------------------
+      # KEYSTORE / SECRETS (PATHS ONLY)
+      # -----------------------------
+      JSON_KEY_FILE: "/root/keys/orchestrator_keystore.json"
+      PASSPHRASE_FILE: "/root/keys/orchestrator_passphrase.txt"
+
+      # Optional — if omitted, derived from keystore
+      ORCHESTRATOR_ADDR: "0xYourOrchestratorAddress"
+
+      # -----------------------------
+      # LOOP TIMING
+      # -----------------------------
+      LOOP_SLEEP_SECS: "60"
+      RECEIPT_TIMEOUT_SECS: "90"
+
+      ############################################
+      # Reward Call SETTINGS
+      ############################################
+      ENABLE_REWARD: "true"
+
+      # -----------------------------
+      # LPT BOND TRANSFER
+      # -----------------------------
+      ENABLE_TRANSFER_BOND: "true"
+      # Minimum bonded LPT to keep on orchestrator (wei)
+      LPT_MIN_RETAIN_WEI: "1000000000000000000" # 1 LPT
+
+      # Recipient of transferred bond
+      LPT_RECEIVER_ADDR: "0xYourStakeOrTreasuryAddress"
+
+      # -----------------------------
+      # FEE WITHDRAWAL
+      # -----------------------------
+      ENABLE_WITHDRAW_FEES: "true"
+      ETH_FEE_WITHDRAW_THRESHOLD_WEI: "1000000000000000" # 0.001 ETH
+      ETH_FEE_RECEIVER_ADDR: "0xYourFeeRecipientAddress"
+
+      # -----------------------------
+      # LOGGING
+      # -----------------------------
+      RUST_LOG: "info"
+    volumes:
+      - lpData:/root/keys
+volumes:
+  lpData:
+    external: true
